@@ -4,6 +4,29 @@ import tempfile
 import json
 import sys
 
+RENDER_ENGINE_CYCLES = False
+
+def remove_unused_images():
+    removed = 0
+    for img in bpy.data.images:
+        if not img.users:
+            bpy.data.images.remove(img)
+            removed += 1
+    print(f"Removed {removed} unused image(s).")
+
+def find_child_armature(parent_name: str):
+    parent = bpy.data.objects.get(parent_name)
+    if not parent:
+        print(f"Parent object '{parent_name}' not found.")
+        return None
+
+    for child in parent.children:
+        if child.type == 'ARMATURE':
+            return child
+
+    print(f"Armature not found under parent '{parent_name}'.")
+    return None
+
 def delete_all_files_in_folder(folder_path):
     """Delete all files in the specified folder."""
     
@@ -131,7 +154,6 @@ def unhide_object_and_children(object_name):
         child.hide_viewport = False
         child.hide_render = False
 
-
 def set_object_show_in_render(obj_name: str, hide: bool):
     obj = bpy.data.objects.get(obj_name)
     if obj:
@@ -139,7 +161,30 @@ def set_object_show_in_render(obj_name: str, hide: bool):
     else:
         print(f"Object not found: {obj_name}")
       
-def render_layer(atlas_name, layer_obj, dungeon_depth, dungeon_width, dest_path):
+def get_layer_collection_by_name(layer_coll, name):
+    if layer_coll.name == name:
+        return layer_coll
+    for child in layer_coll.children:
+        result = get_layer_collection_by_name(child, name)
+        if result:
+            return result
+    return None
+
+def show_collection(target_name, value):
+    view_layer = bpy.context.view_layer
+    root = view_layer.layer_collection
+
+    def apply_visibility(layer_coll, value):
+        name = layer_coll.name
+        if name == target_name:
+            layer_coll.exclude = not value
+        for child in layer_coll.children:
+            apply_visibility(child, value)
+
+    apply_visibility(root, value)
+          
+      
+def render_layer(atlas_name, layer_obj, dungeon_depth, dungeon_width, dest_path, frame_index = 0):
 
     hide_all_objects_except_collection("Environment")
 
@@ -147,38 +192,41 @@ def render_layer(atlas_name, layer_obj, dungeon_depth, dungeon_width, dest_path)
 
     obj = bpy.data.objects.get(layer_obj["name"])
 
-    layer = {
-        "tiles": []
-    }            
+    tiles = []
+    index = 0    
 
-    index = 1
-    
     for z in range(dungeon_depth):
         for x in range(-dungeon_width, dungeon_width+1):
-#            if layer_obj["render_zero"]:
             
             if "render_zero" in layer_obj and layer_obj["render_zero"] == False and z == 0 and x == 0: # skip tile zero
                 continue
-            
+        
             obj.location = (x*3.0, z*3.0, 0.0)
             temp_path = render_to_temp_png()
-            filename = f"{atlas_name.lower()}_{layer_obj['name'].lower()}_{index:03}.png"
+            filename = f"{atlas_name.lower()}_{layer_obj['name'].lower()}_{frame_index:01}_{index:03}.png"
             result = crop_and_save_image(temp_path, f"{dest_path}{filename}")
             if result and isinstance(result, dict):
-                layer["tiles"].append({
+                print(f">> {filename}")
+                tiles.append({
                     "x": x,
                     "z": -z,
                     "screen_coords": result["screen_coords"],
                     "filename": result["filename"],
+                    "frame_index": frame_index
                 })
                 index += 1
                 
-    return layer            
+    # when done rendering this object place it outside camera view
+    obj.location = (21.0, 15.0, 0.0)                
+
+    return tiles            
             
 def render_atlas(atlas):
 
-
-    set_object_show_in_render("Shadow plane", atlas["shadows"])
+    if RENDER_ENGINE_CYCLES:
+        set_object_show_in_render("Shadow plane", atlas["shadows"])
+    else:
+        set_object_show_in_render("Shadow plane", False)
 
     if atlas["front_light"]:
         set_object_show_in_render("Light (Front)", True)
@@ -209,16 +257,53 @@ def render_atlas(atlas):
         "layers": {}
     }
 
+    print(">>>> " + atlas_name)
+
     for layer_obj in atlas["objects"]:
 
-        layer = render_layer(atlas_name, layer_obj, atlas["dungeon_depth"], atlas["dungeon_width"], dest_path)
+        print(">> " + layer_obj["name"].lower())
 
-        if layer and isinstance(layer, dict):
+        if "frames" in layer_obj and layer_obj["frames"]:
+
+            layer = {
+                "tiles": []
+            }        
+        
+            frame_index: int = 0
+            
+            for item in layer_obj["frames"]:
+            
+                bpy.context.scene.frame_set(item) 
+                
+                bpy.context.view_layer.update()
+            
+                tiles = render_layer(atlas_name, layer_obj, atlas["dungeon_depth"], atlas["dungeon_width"], dest_path, frame_index)
+
+                if tiles:
+                    layer["tiles"].extend(tiles)
+                    frame_index += 1
+
+                    
             layer["mode"] = 0
             layer["type"] = 1
             layer["name"] = layer_obj["name"].lower()
             atlas_json["layers"][layer_obj["name"].lower()] = layer
+        
+        else:
 
+            tiles = render_layer(atlas_name, layer_obj, atlas["dungeon_depth"], atlas["dungeon_width"], dest_path)
+
+            if tiles:
+                
+                layer = {
+                    "tiles": []
+                }                   
+                layer["mode"] = 0
+                layer["type"] = 1
+                layer["name"] = layer_obj["name"].lower()
+                atlas_json["layers"][layer_obj["name"].lower()] = {
+                    "tiles": tiles
+                }
         
     json_str = json.dumps(atlas_json, indent=4)
 
@@ -239,6 +324,9 @@ DUNGEON_DEPTH = 6
 VIEWPORT_WIDTH = 1024
 VIEWPORT_HEIGHT = 720
 
+MIST_COLOR = (0.5, 1.0, 0.5, 1.0)
+
+
 # ========================================================================================
 # output path for the generated atlases
 
@@ -249,11 +337,15 @@ output_path = "c://Users/danth/source/repos/AtlasMaker for Blender/atlas_convert
 
 scene = bpy.context.scene
 
-scene.render.engine = 'CYCLES'
-scene.cycles.noise_threshold = 0.01
-scene.cycles.samples = 512
-scene.cycles.time_limit = 2
-
+if RENDER_ENGINE_CYCLES:
+    scene.render.engine = 'CYCLES'
+    scene.cycles.noise_threshold = 0.1
+    scene.cycles.samples = 256
+    scene.cycles.time_limit = 2
+else:
+    scene.render.engine = 'BLENDER_EEVEE_NEXT'
+    scene.eevee.taa_render_samples = 16
+    
 scene.render.image_settings.file_format = 'PNG'
 scene.render.image_settings.color_mode = 'RGBA'
 scene.render.film_transparent = True
@@ -261,8 +353,19 @@ scene.render.resolution_x = VIEWPORT_WIDTH
 scene.render.resolution_y = VIEWPORT_HEIGHT
 
 # ========================================================================================
-# Set up scene
+# set up scene
 
+show_collection("Test dungeon", False)
+
+# ========================================================================================
+# set up environment
+
+tree = scene.node_tree
+node_label = "MistColor"
+
+for node in tree.nodes:
+    if node.label == node_label:
+        node.inputs[2].default_value = MIST_COLOR
 
 # ========================================================================================
 # Set up atlases
@@ -284,9 +387,10 @@ atlases = [
     {
         "name": "enemies",
         "objects": [
-            {"name": "rat", "render_zero": False},
-            {"name": "rat_attack", "render_zero": False},
-            {"name": "rat_die", "render_zero": False}
+            {"name": "rat", "render_zero": False, "frames": [0, 10, 20]},
+            {"name": "rat_attack", "render_zero": False, "frames": [26, 31, 35]},
+            {"name": "rat_die", "render_zero": False, "frames": [12, 18, 70]},
+            {"name": "rat_hit", "render_zero": False, "frames": [27, 37, 57]}
         ],
         "output_path": output_path,
         "dungeon_depth": DUNGEON_DEPTH,
@@ -304,15 +408,32 @@ atlases = [
         "dungeon_width": DUNGEON_WIDTH,
         "front_light": False,
         "shadows": True
-    }      
+    },
+    {
+        "name": "props",
+        "objects": [
+            {"name": "doorway", "render_zero": False}
+        ],
+        "output_path": output_path,
+        "dungeon_depth": DUNGEON_DEPTH,
+        "dungeon_width": DUNGEON_WIDTH,
+        "front_light": True,
+        "shadows": False
+    }         
 ]
 
 # ========================================================================================
 # render atlases
-
-render_atlas(atlases[0])
+                     
+#render_atlas(atlases[0])
 #render_atlas(atlases[1])
 #render_atlas(atlases[2])
+render_atlas(atlases[3])
+
+# ========================================================================================
+# cleanup
+
+remove_unused_images()
 
 # ========================================================================================
 # done

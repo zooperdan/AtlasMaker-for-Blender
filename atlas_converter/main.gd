@@ -53,7 +53,7 @@ func process_atlas(atlas_filename:String, dest_path:String):
 
 	if atlas_json:
 		
-		texture_packer.init(Vector2i(1024, 1024), 2)
+		texture_packer.init(Vector2i(2048, 2048), 2)
 		
 		for key in atlas_json.layers:
 			for tile in atlas_json.layers[key].tiles:
